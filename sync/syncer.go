@@ -115,14 +115,15 @@ const (
 	inProgress status = 1
 	done       status = 2
 
-	blockMsg      server.MessageType = 1
-	layerHashMsg  server.MessageType = 2
-	layerIdsMsg   server.MessageType = 3
-	txMsg         server.MessageType = 4
-	atxMsg        server.MessageType = 5
-	poetMsg       server.MessageType = 6
-	atxIdsMsg     server.MessageType = 7
-	atxIdrHashMsg server.MessageType = 8
+	blockMsg        server.MessageType = 1
+	layerHashMsg    server.MessageType = 2
+	layerIdsMsg     server.MessageType = 3
+	txMsg           server.MessageType = 4
+	atxMsg          server.MessageType = 5
+	poetMsg         server.MessageType = 6
+	atxIdsMsg       server.MessageType = 7
+	atxIdrHashMsg   server.MessageType = 8
+	inputVecMessage server.MessageType = 9
 
 	syncProtocol                      = "/sync/1.0/"
 	validatingLayerNone types.LayerID = 0
@@ -359,8 +360,9 @@ func (s *Syncer) synchronise() {
 
 func (s *Syncer) handleWeaklySynced() {
 	s.With().Info("Node is weakly synced",
-		s.LatestLayer(),
-		s.GetCurrentLayer())
+		log.FieldNamed("latest_layer", s.LatestLayer()),
+		log.FieldNamed("current_layer", s.GetCurrentLayer()),
+	)
 	events.ReportNodeStatusUpdate()
 
 	// handle all layers from processed+1 to current -1
@@ -371,6 +373,7 @@ func (s *Syncer) handleWeaklySynced() {
 	}
 
 	// validate current layer if more than s.ValidationDelta has passed
+	// TODO: remove this since hare runs it?
 	if err := s.handleCurrentLayer(); err != nil {
 		s.With().Error("Node is out of sync", log.Err(err))
 		s.setGossipBufferingStatus(pending)
@@ -462,7 +465,11 @@ func (s *Syncer) handleNotSynced(currentSyncLayer types.LayerID) {
 			}
 		}
 		s.syncAtxs(currentSyncLayer)
-		s.ValidateLayer(lyr) // wait for layer validation
+		// TODO: implement handling hare terminating with no valid blocks.
+		// 	currently hareForLayer is nil if hare hasn't terminated yet.
+		//	 ACT: hare should save something in the db when terminating empty set, sync should check it.
+		hareForLayer, err := s.DB.GetLayerInputVector(lyr.Index())
+		s.ValidateLayer(lyr, hareForLayer) // wait for layer validation
 	}
 
 	// if we are in the first epoch, we need to listen to gossip still
@@ -586,6 +593,15 @@ func (s *Syncer) getLayerFromNeighbors(currentSyncLayer types.LayerID) (*types.L
 		return nil, fmt.Errorf("could not get blocks for layer %v %v", currentSyncLayer, err)
 	}
 
+	input, err := s.syncInputVector(currentSyncLayer)
+	if err != nil {
+		input = nil
+	}
+
+	if err := s.DB.SaveLayerInputVector(currentSyncLayer, input); err != nil {
+		s.Log.Warning("Could'nt save input vector to db %v", err)
+	}
+
 	return types.NewExistingLayer(types.LayerID(currentSyncLayer), blocksArr), nil
 }
 
@@ -643,6 +659,25 @@ func (s *Syncer) syncLayer(layerID types.LayerID, blockIds []types.BlockID) ([]*
 	tmr.ObserveDuration()
 
 	return s.LayerBlocks(layerID)
+}
+
+func (s *Syncer) syncInputVector(layerID types.LayerID) ([]types.BlockID, error) {
+	tmr := newMilliTimer(syncLayerTime)
+	if r, err := s.DB.GetLayerInputVector(layerID); err == nil {
+		return r, nil
+	}
+
+	out := <-fetchWithFactory(newNeighborhoodWorker(s, 1, inputVectorReqFactory(layerID.Bytes())))
+	if out == nil {
+		return nil, fmt.Errorf("could not find input vector with any neighbor")
+
+	}
+
+	inputvec := out.([]types.BlockID)
+
+	tmr.ObserveDuration()
+
+	return inputvec, nil
 }
 
 func (s *Syncer) getBlocks(jobID types.LayerID, blockIds []types.BlockID) error {
@@ -809,7 +844,7 @@ func (s *Syncer) validateBlockView(blk *types.Block) bool {
 		ch <- res
 		return nil
 	}
-	if res, err := s.blockQueue.addDependencies(blk.ID(), blk.ViewEdges, foo); err != nil {
+	if res, err := s.blockQueue.addDependencies(blk.ID(), append(append(blk.ForDiff, blk.NeutralDiff...), blk.AgainstDiff...), foo); err != nil {
 		s.Error(fmt.Sprintf("block %v not syntactically valid", blk.ID()), err)
 		return false
 	} else if res == false {
@@ -1249,7 +1284,16 @@ func (s *Syncer) getAndValidateLayer(id types.LayerID) error {
 	if err != nil {
 		return err
 	}
-	s.ValidateLayer(lyr) // wait for layer validation
+
+	// TODO: Get hare results a.k.a input vector from - db/hare and replace this
+	inputVector, err := s.DB.GetLayerInputVector(id)
+	if err != nil {
+		inputVector = nil
+	}
+
+	s.Log.With().Info("getAndValidateLayer ", id.Field(), log.String("input_vector", fmt.Sprint(inputVector)), log.String("blocks", fmt.Sprint(types.BlockIDs(lyr.Blocks()))))
+
+	s.ValidateLayer(lyr, inputVector) // wait for layer validation
 	return nil
 }
 
